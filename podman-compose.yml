@@ -1,0 +1,128 @@
+# podman-compose.yml — universal across cpu / cuda / rocm / xpu (+ jetson),
+# on both amd64 and arm64. Pick the accelerator with --profile.
+#
+# LOCAL BUILD ONLY — the app image is never pulled from a registry. Two things
+# guarantee that under podman: the `localhost/` prefix on the image name (a
+# fully-qualified local reference podman will never resolve against a registry)
+# and `pull_policy: never`. Only the FROM base
+# (docker.io/library/python:<ver>-slim-bookworm) still comes from a registry.
+#
+# On Linux/macOS the image is built by ebook2audiobook.command --script_mode
+# build_docker with DOCKER_MODE=podman, which calls plain `podman build` with
+# explicit --build-arg flags — it does NOT go through podman-compose. The
+# build: block below exists for the Windows .cmd path, which does call
+# `podman-compose --profile <p> build`, and as a manual fallback.
+#
+# The build context is the WHOLE repo, not just the Dockerfile: the Dockerfile
+# does `COPY . /app` and then runs
+#   ./ebook2audiobook.command --script_mode build_docker --docker_device "$DOCKER_DEVICE_STR"
+# so this file only works from the root of a full checkout, never from a
+# directory holding a lone downloaded Dockerfile.
+#
+# Build (once, via the launcher — it derives DOCKER_DEVICE_STR and the matching
+# base-image Python from the device probe):
+#
+#   ./ebook2audiobook.command --script_mode build_docker --docker_mode podman
+#
+# Then run:
+#
+#   DEVICE_TAG=cpu      podman-compose -f podman-compose.yml --profile cpu    up
+#   DEVICE_TAG=cu130    podman-compose -f podman-compose.yml --profile cuda   up
+#   DEVICE_TAG=jetson51 podman-compose -f podman-compose.yml --profile jetson up
+#   DEVICE_TAG=rocm     podman-compose -f podman-compose.yml --profile rocm   up
+#   DEVICE_TAG=xpu      podman-compose -f podman-compose.yml --profile xpu    up
+#
+# If your podman-compose rejects `pull_policy: never`, drop the line — the
+# localhost/ prefix already makes a registry pull impossible.
+#
+# Architecture (amd64 vs arm64) is NOT a profile. It is decided by the host you
+# build on plus the matching DEVICE_TAG — there is deliberately no `platform:`
+# key, so the build is always native (no silent qemu round trip on the Jetson).
+#
+# Always confirm a profile expands correctly before running it:
+#   DEVICE_TAG=rocm podman-compose --profile rocm config
+
+x-common: &common
+  image: localhost/athomasson2/ebook2audiobook:${DEVICE_TAG:-cpu}
+  pull_policy: never
+  build:
+    context: .
+    dockerfile: Dockerfile
+    args:
+      APP_VERSION: ${APP_VERSION:-26.9.7}
+      DEVICE_TAG: ${DEVICE_TAG:-cpu}
+      # A null value means "resolve from the environment at build time, and if
+      # unset leave the Dockerfile default alone". These are exactly the vars
+      # build_docker_image() in ebook2audiobook.command exports. Without them
+      # the Dockerfile keeps its own defaults — DOCKER_DEVICE_STR is
+      # cuda/cu130/x86_64 — so a --profile cpu build would still resolve the
+      # cuda wheel set. If your podman-compose renders these as NAME=None
+      # instead of a bare --build-arg NAME, give them explicit values here.
+      PYTHON_VERSION:
+      DOCKER_DEVICE_STR:
+      DOCKER_PROGRAMS_STR:
+      CALIBRE_INSTALLER_URL:
+      ISO3_LANG:
+      INSTALL_RUST:
+  working_dir: /app
+  entrypoint: ["bash", "ebook2audiobook.command", "--script_mode", "full_docker"]
+  tty: true
+  stdin_open: true
+  ports:
+    - "7860:7860"
+  security_opt:
+    - label=disable
+  volumes:
+    - ./ebooks:/app/ebooks:rw
+    - ./audiobooks:/app/audiobooks:rw
+    - ./models:/app/models:rw
+    - ./voices:/app/voices:rw
+    - ./tmp:/app/tmp:rw
+  restart: unless-stopped
+
+services:
+  # --- CPU: no device wiring at all -----------------------------------------
+  ebook2audiobook-cpu:
+    <<: *common
+    profiles: [cpu]
+
+  # --- NVIDIA discrete (amd64 dGPU, or arm64 SBSA) via CDI -------------------
+  # Requires a generated CDI spec on the host:
+  #   sudo nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml
+  ebook2audiobook-cuda:
+    <<: *common
+    profiles: [cuda]
+    devices:
+      - nvidia.com/gpu=all
+
+  # --- NVIDIA Jetson / Tegra (arm64 L4T) via CSV runtime --------------------
+  # Requires mode = "csv" in /etc/nvidia-container-runtime/config.toml and the
+  # nvidia runtime registered. On recent JetPack with a generated CDI spec you
+  # can use --profile cuda instead of this profile.
+  ebook2audiobook-jetson:
+    <<: *common
+    profiles: [jetson]
+    runtime: nvidia
+    environment:
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: all
+
+  # --- AMD ROCm -------------------------------------------------------------
+  ebook2audiobook-rocm:
+    <<: *common
+    profiles: [rocm]
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - "${VIDEO_GID:-44}"
+      - "${RENDER_GID:-44}"
+
+  # --- Intel XPU (oneAPI / IPEX) --------------------------------------------
+  ebook2audiobook-xpu:
+    <<: *common
+    profiles: [xpu]
+    devices:
+      - /dev/dri
+    group_add:
+      - "${RENDER_GID:-44}"
